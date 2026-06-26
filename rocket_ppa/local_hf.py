@@ -1,4 +1,4 @@
-"""Hugging Face loading helpers that persist and prefer local model files."""
+"""Hugging Face loading helpers that persist and prefer local model snapshots."""
 
 from __future__ import annotations
 
@@ -15,23 +15,41 @@ def _managed_model_dir(source: str | Path, local_dir: str | Path | None = None) 
     return Path("models") / "hf" / safe_name
 
 
-def _save_pretrained(artifact: T, destination: Path) -> None:
-    save_pretrained = getattr(artifact, "save_pretrained", None)
-    if save_pretrained is None:
-        return
+def _is_recoverable_load_error(error: Exception) -> bool:
+    """Return whether a local HF load error should fall back to a fresh download."""
+
+    if isinstance(error, OSError):
+        return True
+    if isinstance(error, ValueError):
+        message = str(error)
+        return "Unrecognized model" in message or "model_type" in message
+    return False
+
+
+def _download_snapshot(source: str, destination: Path, force_download: bool = False) -> None:
+    """Download a complete Hub snapshot into ``destination`` for direct local loads."""
+
+    from huggingface_hub import snapshot_download
+
     destination.mkdir(parents=True, exist_ok=True)
-    save_pretrained(str(destination))
-    print(f"saved model files to {destination}")
+    snapshot_download(
+        repo_id=source,
+        local_dir=str(destination),
+        local_dir_use_symlinks=False,
+        resume_download=True,
+        force_download=force_download,
+    )
+    print(f"downloaded model snapshot to {destination}")
 
 
 def _load_prefer_local(loader: Callable[..., T], source: str | Path, local_dir: str | Path | None = None, **kwargs: Any) -> T:
-    """Load a HF artifact from a project-local directory/cache before downloading.
+    """Load a HF artifact from a complete project-local Hub snapshot.
 
-    Explicit local paths are loaded directly. Hub model IDs are loaded from
-    ``models/hf/<repo--model>`` when present, then from the Hugging Face cache
-    with ``local_files_only=True``. If files are missing, the artifact is
-    downloaded once and saved into the project-local model directory so the next
-    run can use that directory directly.
+    Explicit local paths are loaded directly. Hub model IDs are downloaded as
+    complete snapshots into ``models/hf/<repo--model>`` and then loaded from
+    that directory. This avoids re-saving an already-instantiated model, which
+    can omit tokenizer/config files and leave the managed directory unusable for
+    a later model load.
     """
 
     source_path = Path(source).expanduser()
@@ -45,18 +63,19 @@ def _load_prefer_local(loader: Callable[..., T], source: str | Path, local_dir: 
         try:
             print(f"loading saved model files from {managed_dir}")
             return loader(str(managed_dir), **kwargs)
-        except OSError:
-            print(f"saved model directory {managed_dir} is incomplete; checking Hugging Face cache")
+        except Exception as error:
+            if not _is_recoverable_load_error(error):
+                raise
+            print(
+                f"saved model directory {managed_dir} is not loadable ({error}); "
+                "downloading a fresh Hugging Face snapshot"
+            )
+            _download_snapshot(source_name, managed_dir, force_download=True)
+            return loader(str(managed_dir), **kwargs)
 
-    try:
-        print(f"checking local Hugging Face cache for {source_name}")
-        artifact = loader(source_name, local_files_only=True, **kwargs)
-    except OSError:
-        print(f"{source_name} is not fully cached locally; downloading missing files")
-        artifact = loader(source_name, **kwargs)
-
-    _save_pretrained(artifact, managed_dir)
-    return artifact
+    print(f"downloading Hugging Face snapshot for {source_name} to {managed_dir}")
+    _download_snapshot(source_name, managed_dir)
+    return loader(str(managed_dir), **kwargs)
 
 
 def load_auto_model_prefer_local(source: str | Path, local_dir: str | Path | None = None, **kwargs: Any) -> Any:
