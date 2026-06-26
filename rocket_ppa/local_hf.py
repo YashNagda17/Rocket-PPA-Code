@@ -24,14 +24,40 @@ def _save_pretrained(artifact: T, destination: Path) -> None:
     print(f"saved model files to {destination}")
 
 
+def _is_recoverable_load_error(error: Exception) -> bool:
+    """Return whether a local HF load error should fall back to a fresh download."""
+
+    if isinstance(error, OSError):
+        return True
+    if isinstance(error, ValueError):
+        message = str(error)
+        return "Unrecognized model" in message or "model_type" in message
+    return False
+
+
+def _download_snapshot(source: str, destination: Path) -> None:
+    """Download a complete Hub snapshot into ``destination`` for direct local loads."""
+
+    from huggingface_hub import snapshot_download
+
+    destination.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=source,
+        local_dir=str(destination),
+        local_dir_use_symlinks=False,
+        resume_download=True,
+    )
+    print(f"downloaded model snapshot to {destination}")
+
+
 def _load_prefer_local(loader: Callable[..., T], source: str | Path, local_dir: str | Path | None = None, **kwargs: Any) -> T:
     """Load a HF artifact from a project-local directory/cache before downloading.
 
     Explicit local paths are loaded directly. Hub model IDs are loaded from
     ``models/hf/<repo--model>`` when present, then from the Hugging Face cache
-    with ``local_files_only=True``. If files are missing, the artifact is
-    downloaded once and saved into the project-local model directory so the next
-    run can use that directory directly.
+    with ``local_files_only=True``. If files are missing or a saved local
+    snapshot is invalid, the Hub snapshot is downloaded into the project-local
+    model directory so the next run can use that directory directly.
     """
 
     source_path = Path(source).expanduser()
@@ -45,15 +71,25 @@ def _load_prefer_local(loader: Callable[..., T], source: str | Path, local_dir: 
         try:
             print(f"loading saved model files from {managed_dir}")
             return loader(str(managed_dir), **kwargs)
-        except OSError:
-            print(f"saved model directory {managed_dir} is incomplete; checking Hugging Face cache")
+        except Exception as error:
+            if not _is_recoverable_load_error(error):
+                raise
+            print(
+                f"saved model directory {managed_dir} is not loadable ({error}); "
+                "downloading a fresh Hugging Face snapshot"
+            )
+            _download_snapshot(source_name, managed_dir)
+            return loader(str(managed_dir), **kwargs)
 
     try:
         print(f"checking local Hugging Face cache for {source_name}")
         artifact = loader(source_name, local_files_only=True, **kwargs)
-    except OSError:
-        print(f"{source_name} is not fully cached locally; downloading missing files")
-        artifact = loader(source_name, **kwargs)
+    except Exception as error:
+        if not _is_recoverable_load_error(error):
+            raise
+        print(f"{source_name} is not fully cached locally ({error}); downloading model snapshot")
+        _download_snapshot(source_name, managed_dir)
+        return loader(str(managed_dir), **kwargs)
 
     _save_pretrained(artifact, managed_dir)
     return artifact
