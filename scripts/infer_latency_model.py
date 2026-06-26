@@ -23,7 +23,13 @@ def resolve_device(torch_module, requested: str):
 
 
 def prompt_from_features(features: dict[str, object]) -> str:
-    return "Predict serving performance from these features. " + "; ".join(f"{key}: {value}" for key, value in features.items())
+    from rocket_ppa.data import build_serving_prompt
+
+    string_features = {key: str(value) for key, value in features.items()}
+    try:
+        return build_serving_prompt(string_features)
+    except ValueError:
+        return "Predict serving performance from these features. " + "; ".join(f"{key}: {value}" for key, value in features.items())
 
 
 def main() -> None:

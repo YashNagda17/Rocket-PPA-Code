@@ -1,4 +1,4 @@
-"""Dataset and normalization utilities for Qwen/RocketPPA fine-tuning."""
+"""Dataset, prompt construction, and normalization utilities for RocketPPA fine-tuning."""
 
 from __future__ import annotations
 
@@ -13,6 +13,72 @@ from torch.utils.data import Dataset
 
 TARGETS = ("first_token_latency", "throughput")
 PROMPT_FIELD = "prompt"
+MODEL_FIELD = "Model"
+ACCELERATOR_FIELD = "Accelerator"
+NUM_CHIPS_FIELD = "Num_Chips"
+BATCH_FIELD = "Batch"
+INPUT_SEQUENCE_FIELD = "Input_Sequence"
+OUTPUT_SEQUENCE_FIELD = "Out_Seq"
+SUPPORTED_MODELS = ("LLaMA3_8B", "Qwen2.5_14B")
+SUPPORTED_ACCELERATORS = ("A100", "V100", "H100")
+SUPPORTED_NUM_CHIPS = ("1", "2")
+
+MODEL_DESCRIPTIONS: dict[str, dict[str, object]] = {
+    "LLaMA3_8B": {
+        "name": "LLaMA 3 8B",
+        "description": "An 8B-parameter decoder-only transformer optimized for efficient general-purpose text generation and instruction following.",
+        "layers": 32,
+        "vocab_size": 128256,
+        "attention_heads": 32,
+        "kv_heads": 8,
+        "embedding_dim": 4096,
+        "context_length": 8192,
+        "speciality": "Grouped-query attention reduces KV-cache bandwidth pressure during autoregressive decoding.",
+        "optimizations": "Use paged KV cache, continuous batching, fused attention kernels, tensor cores with bf16, and graph/cuda-kernel capture where supported.",
+    },
+    "Qwen2.5_14B": {
+        "name": "Qwen2.5 14B",
+        "description": "A 14B-parameter decoder-only Qwen model family member designed for multilingual, coding, math, and long-context workloads.",
+        "layers": 48,
+        "vocab_size": 152064,
+        "attention_heads": 40,
+        "kv_heads": 8,
+        "embedding_dim": 5120,
+        "context_length": 131072,
+        "speciality": "Large vocabulary and long-context training make prompt length and KV-cache size especially important for serving performance.",
+        "optimizations": "Use bf16 tensor cores, FlashAttention-style kernels, paged KV cache, prefill/decode disaggregation when available, and continuous batching.",
+    },
+}
+
+HARDWARE_DESCRIPTIONS: dict[str, dict[str, object]] = {
+    "A100": {
+        "name": "NVIDIA A100 40GB on GCP",
+        "memory": "40 GB HBM2",
+        "compute_bandwidth": "up to 312 TFLOPS bf16 tensor-core throughput",
+        "memory_bandwidth": "about 1.6 TB/s HBM2 bandwidth",
+        "max_storage": "VM-attached local SSD or persistent disk capacity; accelerator memory is 40 GB per chip",
+        "dtype": "bf16",
+        "optimizations": "Exploit tensor cores, NVLink where available, CUDA graphs, fused attention/MLP kernels, and memory-aware KV-cache paging.",
+    },
+    "V100": {
+        "name": "NVIDIA V100 16GB on GCP",
+        "memory": "16 GB HBM2",
+        "compute_bandwidth": "up to 125 TFLOPS tensor-core mixed-precision throughput; bf16 is treated as the configured serving dtype for prompt context",
+        "memory_bandwidth": "about 900 GB/s HBM2 bandwidth",
+        "max_storage": "VM-attached local SSD or persistent disk capacity; accelerator memory is 16 GB per chip",
+        "dtype": "bf16",
+        "optimizations": "Keep batches small enough for 16 GB memory, use fused kernels, quantized or sharded KV cache if needed, and minimize host-device transfers.",
+    },
+    "H100": {
+        "name": "NVIDIA H100 80GB on GCP",
+        "memory": "80 GB HBM3",
+        "compute_bandwidth": "up to about 1,979 TFLOPS bf16 tensor-core throughput with sparsity, about 989 TFLOPS without sparsity",
+        "memory_bandwidth": "about 3.35 TB/s HBM3 bandwidth",
+        "max_storage": "VM-attached local SSD or persistent disk capacity; accelerator memory is 80 GB per chip",
+        "dtype": "bf16",
+        "optimizations": "Use Transformer Engine/bf16 tensor cores, FlashAttention-style kernels, CUDA graphs, larger continuous batches, and efficient KV-cache paging.",
+    },
+}
 
 
 @dataclass
@@ -57,9 +123,42 @@ class LatencyDataset(Dataset):
         return {"prompt": str(row[PROMPT_FIELD]), **targets}
 
 
+def _require_supported(record: dict[str, str], field: str, supported: tuple[str, ...]) -> str:
+    value = str(record.get(field, "")).strip()
+    if value not in supported:
+        raise ValueError(f"unsupported {field}={value!r}; expected one of: {', '.join(supported)}")
+    return value
+
+
+def build_serving_prompt(record: dict[str, str]) -> str:
+    model_key = _require_supported(record, MODEL_FIELD, SUPPORTED_MODELS)
+    accelerator_key = _require_supported(record, ACCELERATOR_FIELD, SUPPORTED_ACCELERATORS)
+    num_chips = _require_supported(record, NUM_CHIPS_FIELD, SUPPORTED_NUM_CHIPS)
+    model = MODEL_DESCRIPTIONS[model_key]
+    hardware = HARDWARE_DESCRIPTIONS[accelerator_key]
+    batch = record.get(BATCH_FIELD, "")
+    input_sequence = record.get(INPUT_SEQUENCE_FIELD, "")
+    output_sequence = record.get(OUTPUT_SEQUENCE_FIELD, "")
+    return (
+        "Predict LLM serving performance for this configuration.\n"
+        f"Model: {model['name']} ({model_key}). {model['description']} "
+        f"Architecture: layers={model['layers']}, vocab_size={model['vocab_size']}, attention_heads={model['attention_heads']}, "
+        f"kv_heads={model['kv_heads']}, embedding_dim={model['embedding_dim']}, context_length={model['context_length']}. "
+        f"Model optimizations for faster performance: {model['optimizations']} "
+        f"Model speciality: {model['speciality']}\n"
+        f"Hardware: {hardware['name']} with num_chips={num_chips}. Accelerator memory={hardware['memory']}; "
+        f"compute bandwidth={hardware['compute_bandwidth']}; memory bandwidth={hardware['memory_bandwidth']}; "
+        f"max storage={hardware['max_storage']}; dtype={hardware['dtype']}. "
+        f"Hardware optimizations: {hardware['optimizations']}\n"
+        f"Workload: batch={batch}; input_sequence_tokens={input_sequence}; output_sequence_tokens={output_sequence}."
+    )
+
+
 def _row_to_prompt(record: dict[str, str]) -> str:
     if PROMPT_FIELD in record and record[PROMPT_FIELD]:
         return record[PROMPT_FIELD]
+    if {MODEL_FIELD, ACCELERATOR_FIELD, NUM_CHIPS_FIELD, BATCH_FIELD, INPUT_SEQUENCE_FIELD, OUTPUT_SEQUENCE_FIELD}.issubset(record):
+        return build_serving_prompt(record)
     feature_parts = [f"{key}: {value}" for key, value in record.items() if key not in TARGETS]
     return "Predict serving performance from these features. " + "; ".join(feature_parts)
 
@@ -75,7 +174,8 @@ def load_rows(path: str | Path) -> list[dict[str, str | float]]:
         raise ValueError("dataset is empty")
     rows: list[dict[str, str | float]] = []
     for record in records:
-        row: dict[str, str | float] = {PROMPT_FIELD: _row_to_prompt({key: str(value) for key, value in record.items()})}
+        string_record = {key: str(value) for key, value in record.items()}
+        row: dict[str, str | float] = {PROMPT_FIELD: _row_to_prompt(string_record)}
         for target in TARGETS:
             if target not in record:
                 raise ValueError(f"missing required target column: {target}")

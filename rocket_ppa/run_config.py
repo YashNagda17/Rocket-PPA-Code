@@ -6,7 +6,7 @@ Python module that defines TRAIN_CONFIG and/or INFER_CONFIG.
 
 TRAIN_CONFIG = {
     "data": "data/latency.csv",
-    "output": "checkpoints/rocket_ppa_qwen",
+    "output": "models/rocket_ppa_qwen",
     "base_model": "Qwen/Qwen3.5-4B",
     "epochs": 3,
     "batch_size": 2,
@@ -21,15 +21,19 @@ TRAIN_CONFIG = {
     "lora_alpha": 32.0,
     "device": "auto",
     "bf16": False,
+    "save_base_model": True,
 }
 
 INFER_CONFIG = {
-    "checkpoint": "checkpoints/rocket_ppa_qwen",
+    "checkpoint": "models/rocket_ppa_qwen",
     "prompt": None,
     "features": {
-        "prompt_tokens": 128,
-        "batch_size": 1,
-        "gpu_memory_gb": 80,
+        "Model": "LLaMA3_8B",
+        "Accelerator": "H100",
+        "Num_Chips": 1,
+        "Batch": 1,
+        "Input_Sequence": 128,
+        "Out_Seq": 128,
     },
     "max_length": 512,
     "device": "auto",
