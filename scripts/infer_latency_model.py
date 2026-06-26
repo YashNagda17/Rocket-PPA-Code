@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run Qwen/RocketPPA latency and throughput inference."""
+"""Run Qwen/RocketPPA direct latency inference."""
 
 from __future__ import annotations
 
@@ -23,13 +23,12 @@ def resolve_device(torch_module, requested: str):
 
 
 def prompt_from_features(features: dict[str, object]) -> str:
-    from rocket_ppa.data import build_serving_prompt
+    from rocket_ppa.data import SERVING_FIELDS, build_serving_prompt
 
     string_features = {key: str(value) for key, value in features.items()}
-    try:
+    if set(SERVING_FIELDS).issubset(string_features):
         return build_serving_prompt(string_features)
-    except ValueError:
-        return "Predict serving performance from these features. " + "; ".join(f"{key}: {value}" for key, value in features.items())
+    return "Predict serving performance from these features. " + "; ".join(f"{key}: {value}" for key, value in features.items())
 
 
 def main() -> None:

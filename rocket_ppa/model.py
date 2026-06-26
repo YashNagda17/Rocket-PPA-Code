@@ -1,10 +1,11 @@
-"""Qwen + RocketPPA regression heads for latency/throughput fine-tuning.
+"""Qwen + RocketPPA direct latency regression fine-tuning.
 
-This module keeps the base language model as Qwen and adds the paper-style
-RocketPPA regression stack on top: final hidden-state average pooling and
-separate top-k Mixture-of-Experts MLP heads for each target.  LoRA is applied to
-the entire Qwen backbone through PEFT while the MoE MLP experts remain fully
-trainable, matching the paper's LoRA + expert-MLP fine-tuning recipe.
+This module keeps the base language model as Qwen and adds one RocketPPA
+regression stack on top: final hidden-state average pooling and a top-k
+Mixture-of-Experts MLP head that predicts end-to-end Latency directly. LoRA is
+applied to the Qwen backbone through PEFT while the routing matrix and MoE MLP
+experts remain trainable, so one loss backpropagation updates LoRA A/B adapter
+weights, expert MLP layers, and routing weights together.
 """
 
 from __future__ import annotations
@@ -29,11 +30,12 @@ def _base_hidden_size(model: PreTrainedModel) -> int:
 
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
+LATENCY_TARGET = "Latency"
 
 
 @dataclass
 class RocketPPAConfig:
-    """Configuration for the RocketPPA regression heads and Qwen LoRA setup."""
+    """Configuration for the RocketPPA latency head and Qwen LoRA setup."""
 
     base_model_name: str = DEFAULT_BASE_MODEL
     hidden_size: int | None = None
@@ -42,27 +44,42 @@ class RocketPPAConfig:
     top_k: int = 3
     expert_hidden_size: int = 1024
     expert_layers: int = 3
-    output_names: tuple[str, str] = ("first_token_latency", "throughput")
+    output_name: str = LATENCY_TARGET
     lora_rank: int = 16
     lora_alpha: float = 32.0
     lora_dropout: float = 0.05
     lora_target_modules: str | list[str] = "all-linear"
 
+    def __post_init__(self) -> None:
+        if self.output_name != LATENCY_TARGET:
+            raise ValueError(f"RocketPPAQwenModel predicts only {LATENCY_TARGET!r}")
+        if self.num_experts < 1:
+            raise ValueError("num_experts must be at least 1")
+        if self.top_k < 1:
+            raise ValueError("top_k must be at least 1")
+        if self.expert_layers < 1:
+            raise ValueError("expert_layers must be at least 1")
+
+    @property
+    def output_names(self) -> tuple[str, ...]:
+        return (self.output_name,)
+
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["output_names"] = list(self.output_names)
-        return data
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RocketPPAConfig":
         payload = dict(data)
         if "output_names" in payload:
-            payload["output_names"] = tuple(payload["output_names"])
+            output_names = tuple(payload.pop("output_names"))
+            if output_names != (LATENCY_TARGET,):
+                raise ValueError(f"checkpoint must contain only {LATENCY_TARGET!r}, got {output_names!r}")
+            payload["output_name"] = LATENCY_TARGET
         return cls(**payload)
 
 
 class ExpertMLP(nn.Module):
-    """RocketPPA MLP expert used inside each metric-specific MoE head."""
+    """RocketPPA MLP expert used inside the latency MoE head."""
 
     def __init__(self, input_dim: int, hidden_dim: int, layers: int, dropout: float):
         super().__init__()
@@ -102,7 +119,7 @@ class TopKMoERegressor(nn.Module):
 
 
 class RocketPPAQwenModel(nn.Module):
-    """Qwen backbone with LoRA and RocketPPA MoE regression heads."""
+    """Qwen backbone with LoRA and one RocketPPA MoE latency head."""
 
     def __init__(self, base_model: PreTrainedModel, config: RocketPPAConfig):
         super().__init__()
@@ -110,7 +127,7 @@ class RocketPPAQwenModel(nn.Module):
         self.base_model = base_model
         hidden_size = config.hidden_size or _base_hidden_size(base_model)
         self.final_norm = nn.LayerNorm(hidden_size)
-        self.heads = nn.ModuleDict({name: TopKMoERegressor(hidden_size, config) for name in config.output_names})
+        self.latency_head = TopKMoERegressor(hidden_size, config)
 
     @classmethod
     def from_pretrained(
@@ -142,7 +159,5 @@ class RocketPPAQwenModel(nn.Module):
         mask = torch.ones(input_ids.shape, dtype=hidden.dtype, device=hidden.device) if attention_mask is None else attention_mask.to(hidden.dtype)
         pooled = (hidden * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
         pooled = self.final_norm(pooled)
-        predictions: dict[str, torch.Tensor] = {"pooled_embedding": pooled}
-        for name, head in self.heads.items():
-            predictions[name], predictions[f"{name}_gate"] = head(pooled)
-        return predictions
+        latency, gate_probs = self.latency_head(pooled)
+        return {"pooled_embedding": pooled, LATENCY_TARGET: latency, f"{LATENCY_TARGET}_gate": gate_probs}

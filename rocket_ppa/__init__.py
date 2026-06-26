@@ -1,4 +1,4 @@
-"""RocketPPA-style Qwen latency/throughput predictor."""
+"""RocketPPA-style Qwen direct latency predictor."""
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
 

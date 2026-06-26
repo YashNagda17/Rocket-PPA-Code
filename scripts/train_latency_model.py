@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Fine-tune Qwen LoRA adapters plus RocketPPA MoE MLP experts."""
+"""Fine-tune Qwen LoRA adapters plus one RocketPPA MoE MLP latency head."""
 
 from __future__ import annotations
 
@@ -16,10 +16,11 @@ def build_collate(tokenizer, max_length: int):
     def collate(batch: list[dict[str, object]]) -> dict[str, object]:
         import torch
 
+        from rocket_ppa.model import LATENCY_TARGET
+
         prompts = [str(item["prompt"]) for item in batch]
         encoded = tokenizer(prompts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
-        for name in ("first_token_latency", "throughput"):
-            encoded[name] = torch.stack([item[name] for item in batch])
+        encoded[LATENCY_TARGET] = torch.stack([item[LATENCY_TARGET] for item in batch])
         return encoded
 
     return collate
@@ -39,6 +40,8 @@ def run_epoch(model, loader, optimizer, device) -> float:
     import torch
     from torch import nn
 
+    from rocket_ppa.model import LATENCY_TARGET
+
     training = optimizer is not None
     model.train(training)
     loss_fn = nn.SmoothL1Loss()
@@ -47,10 +50,10 @@ def run_epoch(model, loader, optimizer, device) -> float:
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        targets = {name: batch[name].to(device) for name in model.config.output_names}
+        target = batch[LATENCY_TARGET].to(device)
         with torch.set_grad_enabled(training):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = sum(loss_fn(outputs[name], targets[name]) for name in model.config.output_names)
+            loss = loss_fn(outputs[LATENCY_TARGET], target)
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -58,6 +61,23 @@ def run_epoch(model, loader, optimizer, device) -> float:
         total += loss.item() * input_ids.shape[0]
         count += input_ids.shape[0]
     return total / max(count, 1)
+
+
+def ensure_one_loss_trains_all_required_components(model) -> None:
+    trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    required = {
+        "LoRA A adapters": ("lora_A",),
+        "LoRA B adapters": ("lora_B",),
+        "MoE expert MLP layers": ("latency_head.experts",),
+        "top-k routing weights": ("latency_head.gate",),
+    }
+    missing = [
+        label
+        for label, needles in required.items()
+        if not any(any(needle in name for needle in needles) for name in trainable_names)
+    ]
+    if missing:
+        raise RuntimeError(f"single latency loss cannot train missing components: {', '.join(missing)}")
 
 
 def main() -> None:
@@ -118,6 +138,7 @@ def main() -> None:
     device = resolve_device(torch, args.device)
     dtype = torch.bfloat16 if args.bf16 and device.type == "cuda" else None
     model = RocketPPAQwenModel.from_pretrained(config, torch_dtype=dtype).to(device)
+    ensure_one_loss_trains_all_required_components(model)
     optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=args.lr)
     best_val = float("inf")
     best_state = None
@@ -127,7 +148,11 @@ def main() -> None:
         print(f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
         if val_loss <= best_val:
             best_val = val_loss
-            best_state = {key: value.detach().cpu() for key, value in model.state_dict().items() if "lora_" in key or "heads" in key or "final_norm" in key}
+            best_state = {
+                key: value.detach().cpu()
+                for key, value in model.state_dict().items()
+                if "lora_" in key or "latency_head" in key or "final_norm" in key
+            }
     if best_state is not None:
         model.load_state_dict(best_state, strict=False)
     Path(args.output).mkdir(parents=True, exist_ok=True)
