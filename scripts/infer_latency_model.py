@@ -33,15 +33,14 @@ def prompt_from_features(features: dict[str, object]) -> str:
 
 def main() -> None:
     import torch
-    from transformers import AutoTokenizer
-
     from rocket_ppa.checkpoint import load_checkpoint
     from rocket_ppa.config_loader import load_config, require_keys
+    from rocket_ppa.local_hf import load_auto_tokenizer_prefer_local
 
     args = load_config("INFER_CONFIG")
     require_keys(args, ("checkpoint", "prompt", "features", "max_length", "device"))
     model, normalizer = load_checkpoint(args.checkpoint)
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True)
+    tokenizer = load_auto_tokenizer_prefer_local(args.checkpoint, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     prompt = args.prompt

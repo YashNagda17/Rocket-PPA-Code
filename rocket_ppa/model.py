@@ -17,7 +17,9 @@ import torch
 from peft import LoraConfig, TaskType, get_peft_model
 from torch import nn
 from torch.nn import functional as F
-from transformers import AutoModel, PreTrainedModel
+from transformers import PreTrainedModel
+
+from .local_hf import load_auto_model_prefer_local
 
 
 def _base_hidden_size(model: PreTrainedModel) -> int:
@@ -136,7 +138,7 @@ class RocketPPAQwenModel(nn.Module):
         torch_dtype: torch.dtype | None = None,
         device_map: str | dict[str, int] | None = None,
     ) -> "RocketPPAQwenModel":
-        base_model = AutoModel.from_pretrained(
+        base_model = load_auto_model_prefer_local(
             config.base_model_name,
             torch_dtype=torch_dtype,
             device_map=device_map,
@@ -158,6 +160,7 @@ class RocketPPAQwenModel(nn.Module):
         hidden = outputs.last_hidden_state
         mask = torch.ones(input_ids.shape, dtype=hidden.dtype, device=hidden.device) if attention_mask is None else attention_mask.to(hidden.dtype)
         pooled = (hidden * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled = pooled.to(self.final_norm.weight.dtype)
         pooled = self.final_norm(pooled)
         latency, gate_probs = self.latency_head(pooled)
         return {"pooled_embedding": pooled, LATENCY_TARGET: latency, f"{LATENCY_TARGET}_gate": gate_probs}

@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import csv
 import random
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -21,6 +24,8 @@ def build_collate(tokenizer, max_length: int):
         prompts = [str(item["prompt"]) for item in batch]
         encoded = tokenizer(prompts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
         encoded[LATENCY_TARGET] = torch.stack([item[LATENCY_TARGET] for item in batch])
+        encoded["prompts"] = prompts
+        encoded["prompt_char_counts"] = torch.tensor([len(prompt) for prompt in prompts], dtype=torch.long)
         return encoded
 
     return collate
@@ -36,7 +41,50 @@ def resolve_device(torch_module, requested: str):
     return torch_module.device(requested)
 
 
-def run_epoch(model, loader, optimizer, device) -> float:
+class TrainingCsvLogger:
+    """Append-and-flush CSV logger for per-sample, per-batch, and per-epoch metrics."""
+
+    fieldnames = (
+        "record_type",
+        "model",
+        "epoch",
+        "phase",
+        "iteration",
+        "batch_index",
+        "sample_index",
+        "batch_size",
+        "prompt_chars",
+        "prompt_tokens",
+        "loss",
+        "epoch_loss",
+        "elapsed_seconds",
+        "real_latency",
+        "predicted_latency",
+        "normalized_real_latency",
+        "normalized_predicted_latency",
+        "prompt",
+    )
+
+    def __init__(self, path: str | Path, model_name: str):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(self.handle, fieldnames=self.fieldnames)
+        self.writer.writeheader()
+        self.handle.flush()
+        self.model_name = model_name
+
+    def log(self, **row: Any) -> None:
+        record = {field: row.get(field, "") for field in self.fieldnames}
+        record["model"] = record["model"] or self.model_name
+        self.writer.writerow(record)
+        self.handle.flush()
+
+    def close(self) -> None:
+        self.handle.close()
+
+
+def run_epoch(model, loader, optimizer, device, normalizer, logger: TrainingCsvLogger, epoch: int, phase: str, iteration: int) -> tuple[float, int]:
     import torch
     from torch import nn
 
@@ -47,20 +95,77 @@ def run_epoch(model, loader, optimizer, device) -> float:
     loss_fn = nn.SmoothL1Loss()
     total = 0.0
     count = 0
-    for batch in loader:
+    epoch_started = time.perf_counter()
+    for batch_index, batch in enumerate(loader, start=1):
+        iteration += 1
+        batch_started = time.perf_counter()
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         target = batch[LATENCY_TARGET].to(device)
         with torch.set_grad_enabled(training):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = loss_fn(outputs[LATENCY_TARGET], target)
+            prediction = outputs[LATENCY_TARGET]
+            loss = loss_fn(prediction, target)
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-        total += loss.item() * input_ids.shape[0]
-        count += input_ids.shape[0]
-    return total / max(count, 1)
+
+        batch_size = input_ids.shape[0]
+        prompt_tokens = attention_mask.detach().sum(dim=1).cpu().tolist()
+        prompt_chars = batch["prompt_char_counts"].cpu().tolist()
+        normalized_real = target.detach().cpu()
+        normalized_predicted = prediction.detach().cpu()
+        real_latency = normalizer.denormalize_prediction(LATENCY_TARGET, normalized_real).tolist()
+        predicted_latency = normalizer.denormalize_prediction(LATENCY_TARGET, normalized_predicted).tolist()
+        batch_loss = loss.item()
+        batch_elapsed = time.perf_counter() - batch_started
+        for sample_index, prompt in enumerate(batch["prompts"]):
+            logger.log(
+                record_type="sample",
+                epoch=epoch,
+                phase=phase,
+                iteration=iteration,
+                batch_index=batch_index,
+                sample_index=sample_index,
+                batch_size=batch_size,
+                prompt_chars=prompt_chars[sample_index],
+                prompt_tokens=prompt_tokens[sample_index],
+                loss=batch_loss,
+                elapsed_seconds=batch_elapsed,
+                real_latency=real_latency[sample_index],
+                predicted_latency=predicted_latency[sample_index],
+                normalized_real_latency=normalized_real[sample_index].item(),
+                normalized_predicted_latency=normalized_predicted[sample_index].item(),
+                prompt=prompt,
+            )
+        logger.log(
+            record_type="batch",
+            epoch=epoch,
+            phase=phase,
+            iteration=iteration,
+            batch_index=batch_index,
+            batch_size=batch_size,
+            prompt_chars=sum(prompt_chars),
+            prompt_tokens=sum(prompt_tokens),
+            loss=batch_loss,
+            elapsed_seconds=batch_elapsed,
+        )
+        total += batch_loss * batch_size
+        count += batch_size
+    epoch_loss = total / max(count, 1)
+    epoch_elapsed = time.perf_counter() - epoch_started
+    logger.log(
+        record_type="epoch",
+        epoch=epoch,
+        phase=phase,
+        iteration=iteration,
+        batch_size=count,
+        loss=epoch_loss,
+        epoch_loss=epoch_loss,
+        elapsed_seconds=epoch_elapsed,
+    )
+    return epoch_loss, iteration
 
 
 def ensure_one_loss_trains_all_required_components(model) -> None:
@@ -83,11 +188,10 @@ def ensure_one_loss_trains_all_required_components(model) -> None:
 def main() -> None:
     import torch
     from torch.utils.data import DataLoader, random_split
-    from transformers import AutoTokenizer
-
     from rocket_ppa.checkpoint import save_checkpoint
     from rocket_ppa.config_loader import load_config, require_keys
     from rocket_ppa.data import LatencyDataset, load_rows
+    from rocket_ppa.local_hf import load_auto_tokenizer_prefer_local
     from rocket_ppa.model import RocketPPAConfig, RocketPPAQwenModel
 
     args = load_config("TRAIN_CONFIG")
@@ -121,7 +225,7 @@ def main() -> None:
     train_size = len(dataset) - val_size
     generator = torch.Generator().manual_seed(args.seed)
     train_set, val_set = random_split(dataset, [train_size, val_size], generator=generator) if val_size else (dataset, None)
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+    tokenizer = load_auto_tokenizer_prefer_local(args.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     collate = build_collate(tokenizer, args.max_length)
@@ -140,19 +244,28 @@ def main() -> None:
     model = RocketPPAQwenModel.from_pretrained(config, torch_dtype=dtype).to(device)
     ensure_one_loss_trains_all_required_components(model)
     optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=args.lr)
+    metrics_csv = Path(getattr(args, "metrics_csv", None) or Path(args.output) / "training_metrics.csv")
+    logger = TrainingCsvLogger(metrics_csv, args.base_model)
     best_val = float("inf")
     best_state = None
-    for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(model, train_loader, optimizer, device)
-        val_loss = run_epoch(model, val_loader, None, device) if val_loader else train_loss
-        print(f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
-        if val_loss <= best_val:
-            best_val = val_loss
-            best_state = {
-                key: value.detach().cpu()
-                for key, value in model.state_dict().items()
-                if "lora_" in key or "latency_head" in key or "final_norm" in key
-            }
+    iteration = 0
+    try:
+        for epoch in range(1, args.epochs + 1):
+            train_loss, iteration = run_epoch(model, train_loader, optimizer, device, dataset.normalizer, logger, epoch, "train", iteration)
+            if val_loader:
+                val_loss, iteration = run_epoch(model, val_loader, None, device, dataset.normalizer, logger, epoch, "val", iteration)
+            else:
+                val_loss = train_loss
+            print(f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f} metrics_csv={metrics_csv}")
+            if val_loss <= best_val:
+                best_val = val_loss
+                best_state = {
+                    key: value.detach().cpu()
+                    for key, value in model.state_dict().items()
+                    if "lora_" in key or "latency_head" in key or "final_norm" in key
+                }
+    finally:
+        logger.close()
     if best_state is not None:
         model.load_state_dict(best_state, strict=False)
     Path(args.output).mkdir(parents=True, exist_ok=True)

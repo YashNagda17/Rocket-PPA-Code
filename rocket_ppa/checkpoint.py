@@ -7,9 +7,8 @@ from pathlib import Path
 
 import torch
 from peft import PeftModel
-from transformers import AutoModel
-
 from .data import Normalizer
+from .local_hf import load_auto_model_prefer_local
 from .model import RocketPPAConfig, RocketPPAQwenModel
 
 
@@ -33,7 +32,7 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     config = RocketPPAConfig.from_dict(json.loads((path / "config.json").read_text(encoding="utf-8")))
     base_model_path = path / "base_model"
     base_source = str(base_model_path) if base_model_path.exists() else config.base_model_name
-    base = AutoModel.from_pretrained(base_source, trust_remote_code=True, device_map=None)
+    base = load_auto_model_prefer_local(base_source, trust_remote_code=True, device_map=None)
     base_model = PeftModel.from_pretrained(base, path / "qwen_lora")
     model = RocketPPAQwenModel(base_model, config)
     head_state = torch.load(path / "rocket_ppa_heads.pt", map_location=map_location)
