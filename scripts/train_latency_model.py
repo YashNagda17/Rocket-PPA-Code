@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import os
+from dataclasses import dataclass
 import random
 import sys
 import time
@@ -16,20 +17,28 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def build_collate(tokenizer, max_length: int):
-    def collate(batch: list[dict[str, object]]) -> dict[str, object]:
+@dataclass
+class LatencyCollator:
+    """Picklable DataLoader collator for tokenized latency batches."""
+
+    tokenizer: Any
+    max_length: int
+
+    def __call__(self, batch: list[dict[str, object]]) -> dict[str, object]:
         import torch
 
         from rocket_ppa.model import LATENCY_TARGET
 
         prompts = [str(item["prompt"]) for item in batch]
-        encoded = tokenizer(prompts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+        encoded = self.tokenizer(prompts, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
         encoded[LATENCY_TARGET] = torch.stack([item[LATENCY_TARGET] for item in batch])
         encoded["prompts"] = prompts
         encoded["prompt_char_counts"] = torch.tensor([len(prompt) for prompt in prompts], dtype=torch.long)
         return encoded
 
-    return collate
+
+def build_collate(tokenizer, max_length: int):
+    return LatencyCollator(tokenizer=tokenizer, max_length=max_length)
 
 
 def resolve_device(torch_module, requested: str):
