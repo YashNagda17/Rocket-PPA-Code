@@ -90,6 +90,7 @@ def main() -> None:
             "lora_alpha",
             "device",
             "bf16",
+            "save_base_model",
         ),
     )
     random.seed(args.seed)
@@ -130,7 +131,7 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state, strict=False)
     Path(args.output).mkdir(parents=True, exist_ok=True)
-    save_checkpoint(args.output, model, dataset.normalizer)
+    save_checkpoint(args.output, model, dataset.normalizer, save_base_model=args.save_base_model)
     tokenizer.save_pretrained(args.output)
 
 

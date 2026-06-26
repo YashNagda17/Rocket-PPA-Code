@@ -15,6 +15,9 @@ MLP stack per target, log + z-score target normalization, and Smooth L1 training
 The scripts read Python variables from `rocket_ppa/run_config.py` instead of CLI
 flags. The CLIs support `device = "auto"`, `"cpu"`, and `"cuda"`; CPU uses
 float32 for compatibility, while GPU training can opt into `bf16 = True`.
+Checkpoints are written under `models/` by default, including the LoRA adapter,
+RocketPPA heads, tokenizer, normalizer, and a `base_model/` snapshot when
+`save_base_model = True`.
 
 ## Install
 
@@ -29,16 +32,17 @@ Edit the Python dictionaries in `rocket_ppa/run_config.py`:
 ```python
 TRAIN_CONFIG = {
     "data": "data/latency.csv",
-    "output": "checkpoints/rocket_ppa_qwen",
+    "output": "models/rocket_ppa_qwen",
     "base_model": "Qwen/Qwen3.5-4B",
     "device": "auto",
     "bf16": False,
+    "save_base_model": True,
     # ...training hyperparameters...
 }
 
 INFER_CONFIG = {
-    "checkpoint": "checkpoints/rocket_ppa_qwen",
-    "features": {"prompt_tokens": 128, "batch_size": 1, "gpu_memory_gb": 80},
+    "checkpoint": "models/rocket_ppa_qwen",
+    "features": {"Model": "LLaMA3_8B", "Accelerator": "H100", "Num_Chips": 1, "Batch": 1, "Input_Sequence": 128, "Out_Seq": 128},
     "prompt": None,
     "device": "auto",
 }
@@ -49,19 +53,23 @@ same variables and run with `ROCKET_PPA_CONFIG_MODULE=my_config_module`.
 
 ## Training data format
 
-Use CSV or JSONL. Every row must include both targets:
+Use CSV or JSONL. Every row must include both targets. For dynamic prompt
+construction, provide the serving configuration columns below:
 
 ```csv
-prompt,first_token_latency,throughput
-"prompt_tokens: 128; batch_size: 1; gpu: H100; memory_gb: 80",0.12,42.5
+Model,Accelerator,Num_Chips,Batch,Input_Sequence,Out_Seq,first_token_latency,throughput
+LLaMA3_8B,H100,1,1,128,128,0.12,42.5
+Qwen2.5_14B,A100,2,4,1024,256,0.31,88.0
 ```
 
-If `prompt` is omitted, all non-target columns are converted into a simple prompt:
+Supported values are `Model in {LLaMA3_8B, Qwen2.5_14B}`, `Accelerator in
+{A100, V100, H100}`, and `Num_Chips in {1, 2}`. The prompt template injects
+model architecture details, model optimizations, GCP accelerator memory/compute
+and memory-bandwidth context, bf16 dtype, hardware optimizations, and the row
+workload (`Batch`, `Input_Sequence`, and `Out_Seq`).
 
-```csv
-prompt_tokens,batch_size,gpu_memory_gb,first_token_latency,throughput
-128,1,80,0.12,42.5
-```
+If a `prompt` column is present, it is used as-is. If the serving columns are
+missing, all non-target columns are converted into a simple fallback prompt.
 
 ## Commands
 
