@@ -22,6 +22,8 @@ TRAIN_CONFIG = {
     "device": "auto",
     "bf16": False,
     "save_base_model": True,
+    "cpu_threads": 64,
+    "num_workers": 64,
 }
 
 INFER_CONFIG = {
