@@ -1,22 +1,27 @@
 # Qwen + RocketPPA Latency Predictor
 
 This repository contains a PyTorch implementation of the RocketPPA fine-tuning
-recipe adapted for LLM-serving performance prediction.
+recipe adapted for LLM-serving latency prediction.
 
 The model uses **Qwen/Qwen3.5-4B** as the default base model, applies **LoRA across
-all linear layers of the Qwen backbone**, and trains **RocketPPA-style top-k MoE
-MLP expert heads** to predict:
+all linear layers of the Qwen backbone**, and trains one **RocketPPA-style top-k
+MoE MLP head** to predict the target column directly:
 
-- `first_token_latency`
-- `throughput`
+- `Latency`
 
-The heads use the final Qwen hidden states, masked average pooling, one gated MoE
-MLP stack per target, log + z-score target normalization, and Smooth L1 training.
+The head uses the final Qwen hidden states, masked average pooling, a gated MoE
+MLP stack, log + z-score target normalization, and Smooth L1 training. Training
+uses one latency loss, so the same backpropagation step updates the LoRA adapter
+A/B weights, the expert MLP layers, and the routing/gating weight matrix at once.
+This follows the RocketPPA paper's implementation pattern: an LLM embedding is
+pooled, a linear router produces expert weights, the top-k experts are
+renormalized, and the final scalar is the weighted sum of the selected expert
+MLP outputs. This repo applies that pattern to one serving metric, `Latency`.
 The scripts read Python variables from `rocket_ppa/run_config.py` instead of CLI
 flags. The CLIs support `device = "auto"`, `"cpu"`, and `"cuda"`; CPU uses
 float32 for compatibility, while GPU training can opt into `bf16 = True`.
 Checkpoints are written under `models/` by default, including the LoRA adapter,
-RocketPPA heads, tokenizer, normalizer, and a `base_model/` snapshot when
+RocketPPA head, tokenizer, normalizer, and a `base_model/` snapshot when
 `save_base_model = True`.
 
 ## Install
@@ -53,20 +58,24 @@ same variables and run with `ROCKET_PPA_CONFIG_MODULE=my_config_module`.
 
 ## Training data format
 
-Use CSV or JSONL. Every row must include both targets. For dynamic prompt
-construction, provide the serving configuration columns below:
+Give the fine-tuning script a CSV or JSONL file directly by setting
+`TRAIN_CONFIG["data"]` to its path. The required target column is `Latency`.
+For dynamic prompt construction, provide these serving configuration columns:
 
 ```csv
-Model,Accelerator,Num_Chips,Batch,Input_Sequence,Out_Seq,first_token_latency,throughput
-LLaMA3_8B,H100,1,1,128,128,0.12,42.5
-Qwen2.5_14B,A100,2,4,1024,256,0.31,88.0
+Model,Accelerator,Num_Chips,Batch,Input_Sequence,Out_Seq,Latency
+LLaMA3_8B,H100,1,1,128,128,3.13
+Qwen2.5_14B,A100,2,4,1024,256,3.22
 ```
 
 Supported values are `Model in {LLaMA3_8B, Qwen2.5_14B}`, `Accelerator in
-{A100, V100, H100}`, and `Num_Chips in {1, 2}`. The prompt template injects
-model architecture details, model optimizations, GCP accelerator memory/compute
-and memory-bandwidth context, bf16 dtype, hardware optimizations, and the row
-workload (`Batch`, `Input_Sequence`, and `Out_Seq`).
+{A100, V100, H100}`, and `Num_Chips in {1, 2}`. Rows whose serving configuration
+is outside those supported bounds are skipped during loading instead of stopping
+training. The prompt template injects model architecture details, model
+optimizations, GCP accelerator memory/compute and memory-bandwidth context,
+bf16 dtype, bf16 perfect-max-bandwidth context, multi-chip interconnect-bandwidth
+context, hardware optimizations, and the row workload (`Batch`, `Input_Sequence`,
+and `Out_Seq`).
 
 If a `prompt` column is present, it is used as-is. If the serving columns are
 missing, all non-target columns are converted into a simple fallback prompt.

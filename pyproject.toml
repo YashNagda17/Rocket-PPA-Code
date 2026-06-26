@@ -1,7 +1,7 @@
 [project]
 name = "rocket-ppa-latency"
 version = "0.1.0"
-description = "Qwen + RocketPPA torch model for first-token latency and throughput prediction"
+description = "Qwen + RocketPPA torch model for direct latency prediction"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.0", "transformers>=4.51.0", "peft>=0.11.0"]
 
