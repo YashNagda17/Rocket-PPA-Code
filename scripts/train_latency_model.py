@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import random
 import sys
 import time
@@ -39,6 +40,30 @@ def resolve_device(torch_module, requested: str):
     if requested == "auto":
         return torch_module.device("cuda" if torch_module.cuda.is_available() else "cpu")
     return torch_module.device(requested)
+
+
+def configure_cpu_environment(cpu_threads: int) -> None:
+    """Configure common CPU backend environment variables before torch imports."""
+
+    if cpu_threads < 1:
+        raise ValueError("cpu_threads must be at least 1")
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
+
+def configure_cpu_parallelism(torch_module, cpu_threads: int) -> None:
+    """Configure PyTorch to use the requested CPU threads."""
+
+    torch_module.set_num_threads(cpu_threads)
+    torch_module.set_num_interop_threads(max(1, min(cpu_threads, 8)))
+    print(
+        "cpu_parallelism="
+        f"threads={torch_module.get_num_threads()} "
+        f"interop_threads={torch_module.get_num_interop_threads()}"
+    )
 
 
 class TrainingCsvLogger:
@@ -186,15 +211,10 @@ def ensure_one_loss_trains_all_required_components(model) -> None:
 
 
 def main() -> None:
-    import torch
-    from torch.utils.data import DataLoader, random_split
-    from rocket_ppa.checkpoint import save_checkpoint
     from rocket_ppa.config_loader import load_config, require_keys
-    from rocket_ppa.data import LatencyDataset, load_rows
-    from rocket_ppa.local_hf import load_auto_tokenizer_prefer_local
-    from rocket_ppa.model import RocketPPAConfig, RocketPPAQwenModel
 
     args = load_config("TRAIN_CONFIG")
+
     require_keys(
         args,
         (
@@ -217,6 +237,19 @@ def main() -> None:
             "save_base_model",
         ),
     )
+    cpu_threads = int(getattr(args, "cpu_threads", os.cpu_count() or 1))
+    num_workers = int(getattr(args, "num_workers", cpu_threads))
+    configure_cpu_environment(cpu_threads)
+
+    import torch
+    from torch.utils.data import DataLoader, random_split
+
+    from rocket_ppa.checkpoint import save_checkpoint
+    from rocket_ppa.data import LatencyDataset, load_rows
+    from rocket_ppa.local_hf import load_auto_tokenizer_prefer_local
+    from rocket_ppa.model import RocketPPAConfig, RocketPPAQwenModel
+
+    configure_cpu_parallelism(torch, cpu_threads)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     rows = load_rows(args.data)
@@ -229,8 +262,25 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     collate = build_collate(tokenizer, args.max_length)
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, collate_fn=collate) if val_set else None
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+    )
+    val_loader = (
+        DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            collate_fn=collate,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+        )
+        if val_set
+        else None
+    )
     config = RocketPPAConfig(
         base_model_name=args.base_model,
         num_experts=args.experts,
