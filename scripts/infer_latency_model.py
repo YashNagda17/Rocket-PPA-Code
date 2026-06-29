@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,6 +23,51 @@ def resolve_device(torch_module, requested: str):
     return torch_module.device(requested)
 
 
+def configure_gpu_environment(gpu_memory_fraction: float) -> None:
+    """Configure CUDA allocator behavior before torch imports."""
+
+    if not 0 < gpu_memory_fraction <= 1:
+        raise ValueError("gpu_memory_fraction must be > 0 and <= 1")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def configure_cpu_environment(cpu_threads: int) -> None:
+    """Configure common CPU backend environment variables before torch imports."""
+
+    if cpu_threads < 1:
+        raise ValueError("cpu_threads must be at least 1")
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+
+
+def configure_gpu_memory(torch_module, gpu_memory_fraction: float) -> None:
+    """Cap this process at the requested fraction of each visible GPU."""
+
+    if not 0 < gpu_memory_fraction <= 1:
+        raise ValueError("gpu_memory_fraction must be > 0 and <= 1")
+    if not torch_module.cuda.is_available():
+        return
+    for device_index in range(torch_module.cuda.device_count()):
+        torch_module.cuda.set_per_process_memory_fraction(gpu_memory_fraction, device=device_index)
+    print(f"gpu_memory_fraction={gpu_memory_fraction:.2f} visible_gpus={torch_module.cuda.device_count()}")
+
+
+def configure_cpu_parallelism(torch_module, cpu_threads: int) -> None:
+    """Configure PyTorch to use all requested cores for this one inference process."""
+
+    if cpu_threads < 1:
+        raise ValueError("cpu_threads must be at least 1")
+    torch_module.set_num_threads(cpu_threads)
+    torch_module.set_num_interop_threads(max(1, min(cpu_threads, 8)))
+    print(
+        "cpu_parallelism="
+        f"threads={torch_module.get_num_threads()} "
+        f"interop_threads={torch_module.get_num_interop_threads()}"
+    )
+
+
 def prompt_from_features(features: dict[str, object]) -> str:
     from rocket_ppa.data import SERVING_FIELDS, build_serving_prompt
 
@@ -32,13 +78,21 @@ def prompt_from_features(features: dict[str, object]) -> str:
 
 
 def main() -> None:
-    import torch
-    from rocket_ppa.checkpoint import load_checkpoint
     from rocket_ppa.config_loader import load_config, require_keys
-    from rocket_ppa.local_hf import load_auto_tokenizer_prefer_local
 
     args = load_config("INFER_CONFIG")
     require_keys(args, ("checkpoint", "prompt", "features", "max_length", "device"))
+    cpu_threads = int(getattr(args, "cpu_threads", os.cpu_count() or 1))
+    gpu_memory_fraction = float(getattr(args, "gpu_memory_fraction", 0.95))
+    configure_cpu_environment(cpu_threads)
+    configure_gpu_environment(gpu_memory_fraction)
+
+    import torch
+    from rocket_ppa.checkpoint import load_checkpoint
+    from rocket_ppa.local_hf import load_auto_tokenizer_prefer_local
+
+    configure_cpu_parallelism(torch, cpu_threads)
+    configure_gpu_memory(torch, gpu_memory_fraction)
     model, normalizer = load_checkpoint(args.checkpoint)
     tokenizer = load_auto_tokenizer_prefer_local(args.checkpoint, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -50,11 +104,34 @@ def main() -> None:
     if prompt is None:
         raise ValueError("set INFER_CONFIG['prompt'] or INFER_CONFIG['features']")
     device = resolve_device(torch, args.device)
-    encoded = tokenizer([prompt], padding=True, truncation=True, max_length=args.max_length, return_tensors="pt").to(device)
+    encoded = tokenizer([prompt], padding=True, truncation=True, max_length=args.max_length, return_tensors="pt")
+    active_token_ids = [
+        int(token_id)
+        for token_id, keep in zip(encoded["input_ids"][0].tolist(), encoded["attention_mask"][0].tolist(), strict=True)
+        if keep
+    ]
+    active_tokens = (
+        tokenizer.convert_ids_to_tokens(active_token_ids)
+        if hasattr(tokenizer, "convert_ids_to_tokens")
+        else [str(token_id) for token_id in active_token_ids]
+    )
+    mlp_input_text = (
+        tokenizer.convert_tokens_to_string(active_tokens)
+        if hasattr(tokenizer, "convert_tokens_to_string")
+        else " ".join(active_tokens)
+    )
+    encoded = encoded.to(device)
     model.to(device).eval()
     with torch.no_grad():
         raw = model(input_ids=encoded["input_ids"], attention_mask=encoded["attention_mask"])
     result = {name: normalizer.denormalize_prediction(name, raw[name].cpu()).item() for name in model.config.output_names}
+    result["debug"] = {
+        "input_token_count": len(active_token_ids),
+        "mlp_input_token_count": raw["mlp_input_token_count"].detach().cpu().tolist(),
+        "input_token_ids": active_token_ids,
+        "input_tokens": active_tokens,
+        "mlp_input_text": mlp_input_text,
+    }
     print(json.dumps(result, indent=2))
 
 

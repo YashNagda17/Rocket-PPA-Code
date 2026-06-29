@@ -20,9 +20,21 @@ MLP outputs. This repo applies that pattern to one serving metric, `Latency`.
 The scripts read Python variables from `rocket_ppa/run_config.py` instead of CLI
 flags. The CLIs support `device = "auto"`, `"cpu"`, and `"cuda"`; CPU uses
 float32 for compatibility, while GPU training can opt into `bf16 = True`.
+For CPU runs, `cpu_threads` controls the PyTorch/BLAS threads used by one
+model process, while `num_workers` controls only DataLoader subprocesses. Keep
+`num_workers = 0` when you want all cores applied to a single model run without
+parallel workers duplicating RAM. For CUDA training on A100, V100, or H100
+systems, `gpu_memory_fraction = 0.95` caps this one process at 95% of each
+visible GPU, and multi-GPU training uses all visible CUDA devices from the same
+training process instead of separate serving processes.
 Checkpoints are written under `models/` by default, including the LoRA adapter,
 RocketPPA head, tokenizer, normalizer, and a `base_model/` snapshot when
-`save_base_model = True`.
+`save_base_model = True`. Training metrics also include each sample's active
+input token IDs, tokenizer token strings, reconstructed input text for the
+tokens that produced the pre-mean hidden states, prompt token count, and the
+token count used to pool hidden states immediately before the RocketPPA MLP
+head. The mean pooled embedding itself is not written to debug logs. Inference
+returns the same token-debug payload under `debug`.
 
 ## Install
 
@@ -42,6 +54,9 @@ TRAIN_CONFIG = {
     "device": "auto",
     "bf16": False,
     "save_base_model": True,
+    "cpu_threads": os.cpu_count() or 1,
+    "num_workers": 0,
+    "gpu_memory_fraction": 0.95,
     # ...training hyperparameters...
 }
 
@@ -50,6 +65,8 @@ INFER_CONFIG = {
     "features": {"Model": "LLaMA3_8B", "Accelerator": "H100", "Num_Chips": 1, "Batch": 1, "Input_Sequence": 128, "Out_Seq": 128},
     "prompt": None,
     "device": "auto",
+    "cpu_threads": os.cpu_count() or 1,
+    "gpu_memory_fraction": 0.95,
 }
 ```
 

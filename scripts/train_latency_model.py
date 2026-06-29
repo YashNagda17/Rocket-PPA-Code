@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 from dataclasses import dataclass
 import random
@@ -31,7 +32,26 @@ class LatencyCollator:
 
         prompts = [str(item["prompt"]) for item in batch]
         encoded = self.tokenizer(prompts, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+        input_ids_for_log = encoded["input_ids"].tolist()
+        token_ids_for_log = []
+        tokens_for_log = []
+        text_for_log = []
+        for row_ids, row_mask in zip(input_ids_for_log, encoded["attention_mask"].tolist(), strict=True):
+            active_ids = [int(token_id) for token_id, keep in zip(row_ids, row_mask, strict=True) if keep]
+            token_ids_for_log.append(active_ids)
+            if hasattr(self.tokenizer, "convert_ids_to_tokens"):
+                active_tokens = self.tokenizer.convert_ids_to_tokens(active_ids)
+            else:
+                active_tokens = [str(token_id) for token_id in active_ids]
+            tokens_for_log.append(active_tokens)
+            if hasattr(self.tokenizer, "convert_tokens_to_string"):
+                text_for_log.append(self.tokenizer.convert_tokens_to_string(active_tokens))
+            else:
+                text_for_log.append(" ".join(active_tokens))
         encoded[LATENCY_TARGET] = torch.stack([item[LATENCY_TARGET] for item in batch])
+        encoded["input_token_ids"] = token_ids_for_log
+        encoded["input_tokens"] = tokens_for_log
+        encoded["mlp_input_text"] = text_for_log
         encoded["prompts"] = prompts
         encoded["prompt_char_counts"] = torch.tensor([len(prompt) for prompt in prompts], dtype=torch.long)
         return encoded
@@ -51,6 +71,14 @@ def resolve_device(torch_module, requested: str):
     return torch_module.device(requested)
 
 
+def configure_gpu_environment(gpu_memory_fraction: float) -> None:
+    """Configure CUDA allocator behavior before torch imports."""
+
+    if not 0 < gpu_memory_fraction <= 1:
+        raise ValueError("gpu_memory_fraction must be > 0 and <= 1")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
 def configure_cpu_environment(cpu_threads: int) -> None:
     """Configure common CPU backend environment variables before torch imports."""
 
@@ -63,9 +91,37 @@ def configure_cpu_environment(cpu_threads: int) -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
 
-def configure_cpu_parallelism(torch_module, cpu_threads: int) -> None:
-    """Configure PyTorch to use the requested CPU threads."""
+def configure_gpu_memory(torch_module, gpu_memory_fraction: float) -> None:
+    """Cap this process at the requested fraction of each visible GPU."""
 
+    if not 0 < gpu_memory_fraction <= 1:
+        raise ValueError("gpu_memory_fraction must be > 0 and <= 1")
+    if not torch_module.cuda.is_available():
+        return
+    for device_index in range(torch_module.cuda.device_count()):
+        torch_module.cuda.set_per_process_memory_fraction(gpu_memory_fraction, device=device_index)
+    print(f"gpu_memory_fraction={gpu_memory_fraction:.2f} visible_gpus={torch_module.cuda.device_count()}")
+
+
+def maybe_wrap_multi_gpu(torch_module, model, device):
+    """Use all visible GPUs from one training process when CUDA is selected."""
+
+    if device.type == "cuda" and torch_module.cuda.device_count() > 1:
+        device_ids = list(range(torch_module.cuda.device_count()))
+        print(f"multi_gpu_training=DataParallel device_ids={device_ids}")
+        return torch_module.nn.DataParallel(model, device_ids=device_ids)
+    return model
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def configure_cpu_parallelism(torch_module, cpu_threads: int) -> None:
+    """Configure PyTorch to use the requested CPU threads for one model process."""
+
+    if cpu_threads < 1:
+        raise ValueError("cpu_threads must be at least 1")
     torch_module.set_num_threads(cpu_threads)
     torch_module.set_num_interop_threads(max(1, min(cpu_threads, 8)))
     print(
@@ -89,6 +145,10 @@ class TrainingCsvLogger:
         "batch_size",
         "prompt_chars",
         "prompt_tokens",
+        "mlp_input_token_count",
+        "input_token_ids",
+        "input_tokens",
+        "mlp_input_text",
         "loss",
         "epoch_loss",
         "elapsed_seconds",
@@ -147,6 +207,7 @@ def run_epoch(model, loader, optimizer, device, normalizer, logger: TrainingCsvL
 
         batch_size = input_ids.shape[0]
         prompt_tokens = attention_mask.detach().sum(dim=1).cpu().tolist()
+        mlp_input_token_counts = outputs["mlp_input_token_count"].detach().cpu().tolist()
         prompt_chars = batch["prompt_char_counts"].cpu().tolist()
         normalized_real = target.detach().cpu()
         normalized_predicted = prediction.detach().cpu()
@@ -165,6 +226,10 @@ def run_epoch(model, loader, optimizer, device, normalizer, logger: TrainingCsvL
                 batch_size=batch_size,
                 prompt_chars=prompt_chars[sample_index],
                 prompt_tokens=prompt_tokens[sample_index],
+                mlp_input_token_count=mlp_input_token_counts[sample_index],
+                input_token_ids=json.dumps(batch["input_token_ids"][sample_index]),
+                input_tokens=json.dumps(batch["input_tokens"][sample_index], ensure_ascii=False),
+                mlp_input_text=batch["mlp_input_text"][sample_index],
                 loss=batch_loss,
                 elapsed_seconds=batch_elapsed,
                 real_latency=real_latency[sample_index],
@@ -182,6 +247,7 @@ def run_epoch(model, loader, optimizer, device, normalizer, logger: TrainingCsvL
             batch_size=batch_size,
             prompt_chars=sum(prompt_chars),
             prompt_tokens=sum(prompt_tokens),
+            mlp_input_token_count=sum(mlp_input_token_counts),
             loss=batch_loss,
             elapsed_seconds=batch_elapsed,
         )
@@ -247,8 +313,12 @@ def main() -> None:
         ),
     )
     cpu_threads = int(getattr(args, "cpu_threads", os.cpu_count() or 1))
-    num_workers = int(getattr(args, "num_workers", cpu_threads))
+    num_workers = int(getattr(args, "num_workers", 0))
+    gpu_memory_fraction = float(getattr(args, "gpu_memory_fraction", 0.95))
+    if num_workers < 0:
+        raise ValueError("num_workers must be at least 0")
     configure_cpu_environment(cpu_threads)
+    configure_gpu_environment(gpu_memory_fraction)
 
     import torch
     from torch.utils.data import DataLoader, random_split
@@ -259,6 +329,8 @@ def main() -> None:
     from rocket_ppa.model import RocketPPAConfig, RocketPPAQwenModel
 
     configure_cpu_parallelism(torch, cpu_threads)
+    configure_gpu_memory(torch, gpu_memory_fraction)
+    print(f"dataloader_workers={num_workers} (0 keeps data loading in the single model process)")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     rows = load_rows(args.data)
@@ -302,6 +374,7 @@ def main() -> None:
     dtype = torch.bfloat16 if args.bf16 and device.type == "cuda" else None
     model = RocketPPAQwenModel.from_pretrained(config, torch_dtype=dtype).to(device)
     ensure_one_loss_trains_all_required_components(model)
+    model = maybe_wrap_multi_gpu(torch, model, device)
     optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=args.lr)
     metrics_csv = Path(getattr(args, "metrics_csv", None) or Path(args.output) / "training_metrics.csv")
     logger = TrainingCsvLogger(metrics_csv, args.base_model)
@@ -320,15 +393,15 @@ def main() -> None:
                 best_val = val_loss
                 best_state = {
                     key: value.detach().cpu()
-                    for key, value in model.state_dict().items()
+                    for key, value in unwrap_model(model).state_dict().items()
                     if "lora_" in key or "latency_head" in key or "final_norm" in key
                 }
     finally:
         logger.close()
     if best_state is not None:
-        model.load_state_dict(best_state, strict=False)
+        unwrap_model(model).load_state_dict(best_state, strict=False)
     Path(args.output).mkdir(parents=True, exist_ok=True)
-    save_checkpoint(args.output, model, dataset.normalizer, save_base_model=args.save_base_model)
+    save_checkpoint(args.output, unwrap_model(model), dataset.normalizer, save_base_model=args.save_base_model)
     tokenizer.save_pretrained(args.output)
 
 
