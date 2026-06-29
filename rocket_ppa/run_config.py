@@ -6,6 +6,14 @@ Python module that defines TRAIN_CONFIG and/or INFER_CONFIG.
 
 import os
 
+
+def effective_cpu_count() -> int:
+    """Return the CPUs available to this process, respecting affinity masks."""
+
+    if hasattr(os, "sched_getaffinity"):
+        return max(1, len(os.sched_getaffinity(0)))
+    return os.cpu_count() or 1
+
 TRAIN_CONFIG = {
     "data": "data/latency.csv",
     "output": "models/rocket_ppa_qwen",
@@ -26,7 +34,7 @@ TRAIN_CONFIG = {
     "save_base_model": True,
     # Use all CPU cores inside one model process. Keep DataLoader workers at 0
     # to avoid spawning parallel model-serving/training processes that duplicate RAM.
-    "cpu_threads": os.cpu_count() or 1,
+    "cpu_threads": effective_cpu_count(),
     "num_workers": 0,
     # Limit this training/inference process to 95% of each visible GPU
     # so CUDA keeps a small safety margin for drivers and display processes.
@@ -46,6 +54,6 @@ INFER_CONFIG = {
     },
     "max_length": 512,
     "device": "auto",
-    "cpu_threads": os.cpu_count() or 1,
+    "cpu_threads": effective_cpu_count(),
     "gpu_memory_fraction": 0.95,
 }

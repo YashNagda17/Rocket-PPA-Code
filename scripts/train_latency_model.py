@@ -79,15 +79,27 @@ def configure_gpu_environment(gpu_memory_fraction: float) -> None:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
+def effective_cpu_count() -> int:
+    """Return the CPUs this process can actually run on, honoring affinity masks."""
+
+    if hasattr(os, "sched_getaffinity"):
+        return max(1, len(os.sched_getaffinity(0)))
+    return os.cpu_count() or 1
+
+
 def configure_cpu_environment(cpu_threads: int) -> None:
     """Configure common CPU backend environment variables before torch imports."""
 
     if cpu_threads < 1:
         raise ValueError("cpu_threads must be at least 1")
-    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
-    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+    thread_count = str(cpu_threads)
+    os.environ["OMP_NUM_THREADS"] = thread_count
+    os.environ["MKL_NUM_THREADS"] = thread_count
+    os.environ["OPENBLAS_NUM_THREADS"] = thread_count
+    os.environ["NUMEXPR_NUM_THREADS"] = thread_count
+    os.environ["TORCH_NUM_THREADS"] = thread_count
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ["MKL_DYNAMIC"] = "FALSE"
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
 
@@ -123,7 +135,7 @@ def configure_cpu_parallelism(torch_module, cpu_threads: int) -> None:
     if cpu_threads < 1:
         raise ValueError("cpu_threads must be at least 1")
     torch_module.set_num_threads(cpu_threads)
-    torch_module.set_num_interop_threads(max(1, min(cpu_threads, 8)))
+    torch_module.set_num_interop_threads(cpu_threads)
     print(
         "cpu_parallelism="
         f"threads={torch_module.get_num_threads()} "
@@ -312,7 +324,7 @@ def main() -> None:
             "save_base_model",
         ),
     )
-    cpu_threads = int(getattr(args, "cpu_threads", os.cpu_count() or 1))
+    cpu_threads = int(getattr(args, "cpu_threads", effective_cpu_count()))
     num_workers = int(getattr(args, "num_workers", 0))
     gpu_memory_fraction = float(getattr(args, "gpu_memory_fraction", 0.95))
     if num_workers < 0:
@@ -372,7 +384,7 @@ def main() -> None:
     )
     device = resolve_device(torch, args.device)
     dtype = torch.bfloat16 if args.bf16 and device.type == "cuda" else None
-    model = RocketPPAQwenModel.from_pretrained(config, torch_dtype=dtype).to(device)
+    model = RocketPPAQwenModel.from_pretrained(config, dtype=dtype).to(device)
     ensure_one_loss_trains_all_required_components(model)
     model = maybe_wrap_multi_gpu(torch, model, device)
     optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=args.lr)

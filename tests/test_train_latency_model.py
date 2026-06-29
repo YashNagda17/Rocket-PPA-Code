@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import pickle
 
 import pytest
@@ -6,7 +7,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from rocket_ppa.model import LATENCY_TARGET
-from scripts.train_latency_model import build_collate, configure_gpu_memory
+from scripts.train_latency_model import (
+    build_collate,
+    configure_cpu_environment,
+    configure_cpu_parallelism,
+    configure_gpu_memory,
+)
 
 
 class SimpleTokenizer:
@@ -63,6 +69,55 @@ def test_collate_logs_active_token_ids_and_tokens_for_debugging():
     assert encoded["input_token_ids"] == [[8, 8, 8], [8, 8]]
     assert encoded["input_tokens"] == [["tok_8", "tok_8", "tok_8"], ["tok_8", "tok_8"]]
     assert encoded["mlp_input_text"] == ["tok_8tok_8tok_8", "tok_8tok_8"]
+
+
+def test_configure_cpu_environment_sets_all_thread_controls(monkeypatch):
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "TORCH_NUM_THREADS",
+        "OMP_DYNAMIC",
+        "MKL_DYNAMIC",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    configure_cpu_environment(48)
+
+    assert os.environ["OMP_NUM_THREADS"] == "48"
+    assert os.environ["MKL_NUM_THREADS"] == "48"
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "48"
+    assert os.environ["NUMEXPR_NUM_THREADS"] == "48"
+    assert os.environ["TORCH_NUM_THREADS"] == "48"
+    assert os.environ["OMP_DYNAMIC"] == "FALSE"
+    assert os.environ["MKL_DYNAMIC"] == "FALSE"
+
+
+def test_configure_cpu_parallelism_uses_all_requested_threads():
+    class FakeTorchThreads:
+        def __init__(self):
+            self.num_threads = None
+            self.interop_threads = None
+
+        def set_num_threads(self, value):
+            self.num_threads = value
+
+        def set_num_interop_threads(self, value):
+            self.interop_threads = value
+
+        def get_num_threads(self):
+            return self.num_threads
+
+        def get_num_interop_threads(self):
+            return self.interop_threads
+
+    fake_torch = FakeTorchThreads()
+
+    configure_cpu_parallelism(fake_torch, 48)
+
+    assert fake_torch.num_threads == 48
+    assert fake_torch.interop_threads == 48
 
 
 def test_run_config_uses_cpu_threads_without_dataloader_workers():

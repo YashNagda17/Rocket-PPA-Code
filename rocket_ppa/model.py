@@ -135,12 +135,15 @@ class RocketPPAQwenModel(nn.Module):
     def from_pretrained(
         cls,
         config: RocketPPAConfig,
-        torch_dtype: torch.dtype | None = None,
+        dtype: torch.dtype | None = None,
         device_map: str | dict[str, int] | None = None,
+        torch_dtype: torch.dtype | None = None,
     ) -> "RocketPPAQwenModel":
+        if dtype is None:
+            dtype = torch_dtype
         base_model = load_auto_model_prefer_local(
             config.base_model_name,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             device_map=device_map,
             trust_remote_code=True,
         )
