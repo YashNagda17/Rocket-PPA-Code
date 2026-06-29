@@ -159,8 +159,13 @@ class RocketPPAQwenModel(nn.Module):
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
         hidden = outputs.last_hidden_state
         mask = torch.ones(input_ids.shape, dtype=hidden.dtype, device=hidden.device) if attention_mask is None else attention_mask.to(hidden.dtype)
-        pooled = (hidden * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mlp_input_token_count = mask.sum(dim=1)
+        pooled = (hidden * mask.unsqueeze(-1)).sum(dim=1) / mlp_input_token_count.unsqueeze(-1).clamp_min(1.0)
         pooled = pooled.to(self.final_norm.weight.dtype)
         pooled = self.final_norm(pooled)
         latency, gate_probs = self.latency_head(pooled)
-        return {"pooled_embedding": pooled, LATENCY_TARGET: latency, f"{LATENCY_TARGET}_gate": gate_probs}
+        return {
+            "mlp_input_token_count": mlp_input_token_count,
+            LATENCY_TARGET: latency,
+            f"{LATENCY_TARGET}_gate": gate_probs,
+        }

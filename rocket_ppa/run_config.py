@@ -4,6 +4,8 @@ Change the dictionaries below, or point ROCKET_PPA_CONFIG_MODULE at another
 Python module that defines TRAIN_CONFIG and/or INFER_CONFIG.
 """
 
+import os
+
 TRAIN_CONFIG = {
     "data": "data/latency.csv",
     "output": "models/rocket_ppa_qwen",
@@ -22,8 +24,13 @@ TRAIN_CONFIG = {
     "device": "auto",
     "bf16": False,
     "save_base_model": True,
-    "cpu_threads": 64,
-    "num_workers": 64,
+    # Use all CPU cores inside one model process. Keep DataLoader workers at 0
+    # to avoid spawning parallel model-serving/training processes that duplicate RAM.
+    "cpu_threads": os.cpu_count() or 1,
+    "num_workers": 0,
+    # Limit this training/inference process to 95% of each visible GPU
+    # so CUDA keeps a small safety margin for drivers and display processes.
+    "gpu_memory_fraction": 0.95,
 }
 
 INFER_CONFIG = {
@@ -39,4 +46,6 @@ INFER_CONFIG = {
     },
     "max_length": 512,
     "device": "auto",
+    "cpu_threads": os.cpu_count() or 1,
+    "gpu_memory_fraction": 0.95,
 }
