@@ -20,10 +20,12 @@ MLP outputs. This repo applies that pattern to one serving metric, `Latency`.
 The scripts read Python variables from `rocket_ppa/run_config.py` instead of CLI
 flags. The CLIs support `device = "auto"`, `"cpu"`, and `"cuda"`; CPU uses
 float32 for compatibility, while GPU training can opt into `bf16 = True`.
-For CPU runs, `cpu_threads` controls the PyTorch/BLAS threads used by one
-model process, while `num_workers` controls only DataLoader subprocesses. Keep
-`num_workers = 0` when you want all cores applied to a single model run without
-parallel workers duplicating RAM. For CUDA training on A100, V100, or H100
+For CPU runs, `cpu_threads` controls the PyTorch/BLAS intra-op and
+inter-op threads used by one model process. The default uses `effective_cpu_count()`, which honors the process
+CPU affinity mask so containers can consume every core they are allowed to use.
+`num_workers` controls only DataLoader subprocesses; keep `num_workers = 0` when
+you want all cores applied to a single model run without parallel workers
+duplicating RAM. For CUDA training on A100, V100, or H100
 systems, `gpu_memory_fraction = 0.95` caps this one process at 95% of each
 visible GPU, and multi-GPU training uses all visible CUDA devices from the same
 training process instead of separate serving processes.
@@ -54,7 +56,7 @@ TRAIN_CONFIG = {
     "device": "auto",
     "bf16": False,
     "save_base_model": True,
-    "cpu_threads": os.cpu_count() or 1,
+    "cpu_threads": effective_cpu_count(),
     "num_workers": 0,
     "gpu_memory_fraction": 0.95,
     # ...training hyperparameters...
@@ -65,7 +67,7 @@ INFER_CONFIG = {
     "features": {"Model": "LLaMA3_8B", "Accelerator": "H100", "Num_Chips": 1, "Batch": 1, "Input_Sequence": 128, "Out_Seq": 128},
     "prompt": None,
     "device": "auto",
-    "cpu_threads": os.cpu_count() or 1,
+    "cpu_threads": effective_cpu_count(),
     "gpu_memory_fraction": 0.95,
 }
 ```
